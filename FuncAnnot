@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ESM-2 embedding + FAISS nearest-neighbor annotation
+
+This script embeds query protein sequences using ESM-2 and searches
+against a precomputed reference embedding database using FAISS.
+
+Input:
+    1. Reference embedding matrix: .npy
+    2. Reference metadata: .tsv
+    3. Query protein FASTA: .faa / .fasta
+
+Output:
+    1. Full top-k search result TSV
+    2. Rank-1 result TSV
+    3. Prokka-like TSV
+    4. FASTA file with rank-1 predicted annotation in headers
+
+Example:
+    python esm_faiss_annotate.py \
+        --known-emb data/all_embeddings.npy \
+        --known-meta data/all_metadata.tsv \
+        --query-faa example/bakta_hypothetical.faa \
+        --outdir results \
+        --prefix bakta_Hypo \
+        --top-k 3 \
+        --score-cutoff 0.80 \
+        --device auto
+"""
+
+import argparse
+import gc
+import hashlib
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import faiss
+import numpy as np
+import pandas as pd
+import torch
+from Bio import SeqIO
+from transformers import AutoTokenizer, EsmModel
+
+
+VALID_AA = set("ACDEFGHIKLMNPQRSTVWYBXZUO")
+
+
+# =========================================================
+# Utility functions
+# =========================================================
+
+def clean_sequence(seq: str) -> str:
+    """
+    Clean protein sequence.
+
+    Non-alphabetic characters are removed.
+    Non-standard amino acids are replaced with X.
+    """
+    seq = str(seq).upper()
+    seq = re.sub(r"[^A-Z]", "", seq)
+    seq = "".join([aa if aa in VALID_AA else "X" for aa in seq])
+    return seq
+
+
+def seq_hash(seq: str) -> str:
+    """Return MD5 hash of a protein sequence."""
+    return hashlib.md5(seq.encode("utf-8")).hexdigest()
+
+
+def extract_annotation(desc: str, protein_id: str) -> str:
+    """
+    Extract annotation text from FASTA description.
+
+    Example:
+        >protein_001 hypothetical protein
+
+    protein_id:
+        protein_001
+
+    annotation:
+        hypothetical protein
+    """
+    desc = str(desc).strip()
+
+    if desc.startswith(protein_id):
+        ann = desc[len(protein_id):].strip()
+    else:
+        ann = desc
+
+    # Remove UniProt-style organism field if present
+    if " OS=" in ann:
+        ann = ann.split(" OS=")[0].strip()
+
+    return ann if ann else protein_id
+
+
+def safe_get(row: pd.Series, col: str, default=""):
+    """
+    Safely get value from pandas Series.
+
+    If column does not exist or value is NaN, return default.
+    """
+    if col in row.index:
+        val = row[col]
+        if pd.isna(val):
+            return default
+        return val
+    return default
+
+
+def check_file_exists(path: Path, label: str) -> None:
+    """Raise FileNotFoundError if the given file does not exist."""
+    if not path.exists():
+        raise FileNotFoundError(f"{label} file not found: {path}")
+
+
+def resolve_device(device_arg: str) -> str:
+    """
+    Resolve device option.
+
+    device_arg:
+        auto, cpu, cuda
+    """
+    if device_arg == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device_arg == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested, but torch.cuda.is_available() is False. "
+            "Use --device cpu or install a CUDA-compatible PyTorch version."
+        )
+
+    return device_arg
+
+
+def configure_torch(
+    device: str,
+    cpu_threads: int,
+    interop_threads: int
+) -> None:
+    """Configure PyTorch CPU/GPU runtime options."""
+    if device == "cpu":
+        torch.set_num_threads(cpu_threads)
+        torch.set_num_interop_threads(interop_threads)
+
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def load_model(
+    model_name: str,
+    device: str,
+    use_dynamic_quant: bool = False
+):
+    """
+    Load ESM model and tokenizer.
+
+    Dynamic quantization is only applied on CPU.
+    """
+    print(f"[INFO] Loading model: {model_name}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = EsmModel.from_pretrained(model_name)
+    model = model.to(device)
+    model.eval()
+
+    if device == "cpu" and use_dynamic_quant:
+        model = torch.ao.quantization.quantize_dynamic(
+            model,
+            {torch.nn.Linear},
+            dtype=torch.qint8
+        )
+        print("[INFO] Dynamic quantization applied.")
+
+    return tokenizer, model
+
+
+def parse_fasta_all(faa_path: Path, max_len: int = 1022) -> List[Dict]:
+    """
+    Parse query FASTA file.
+
+    ESM-2 input length is limited by max_len.
+    Sequence longer than max_len is truncated.
+    """
+    records = []
+
+    for rec in SeqIO.parse(str(faa_path), "fasta"):
+        protein_id = rec.id
+        description = rec.description
+        seq = clean_sequence(str(rec.seq))
+
+        if not seq:
+            continue
+
+        orig_len = len(seq)
+        used_seq = seq[:max_len]
+
+        records.append({
+            "protein_id": protein_id,
+            "description": description,
+            "annotation": extract_annotation(description, protein_id),
+            "sequence": used_seq,
+            "orig_len": orig_len,
+            "used_len": len(used_seq),
+            "seq_hash": seq_hash(used_seq),
+        })
+
+    return records
+
+
+def make_token_buckets(
+    records: List[Dict],
+    max_batch_tokens: int = 12000,
+    sort_by_length: bool = True
+) -> List[List[Tuple[int, Dict]]]:
+    """
+    Create batches based on approximate token count.
+
+    This reduces padding waste by grouping sequences of similar length.
+    """
+    indexed = list(enumerate(records))
+
+    if sort_by_length:
+        indexed.sort(key=lambda x: x[1]["used_len"])
+
+    batches = []
+    current = []
+    current_max_len = 0
+
+    for idx, rec in indexed:
+        seq_len = rec["used_len"]
+        new_max_len = max(current_max_len, seq_len)
+
+        # +2 accounts for special tokens
+        projected_tokens = (len(current) + 1) * (new_max_len + 2)
+
+        if current and projected_tokens > max_batch_tokens:
+            batches.append(current)
+            current = [(idx, rec)]
+            current_max_len = seq_len
+        else:
+            current.append((idx, rec))
+            current_max_len = new_max_len
+
+    if current:
+        batches.append(current)
+
+    return batches
+
+
+def embed_batch(
+    batch_seqs: List[str],
+    tokenizer,
+    model,
+    max_len: int,
+    device: str
+) -> np.ndarray:
+    """
+    Embed protein sequences using mean pooling of ESM hidden states.
+
+    Returns:
+        np.ndarray with shape [batch_size, embedding_dim]
+    """
+    inputs = tokenizer(
+        batch_seqs,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_len
+    )
+
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+        hidden = outputs.last_hidden_state
+
+        attention_mask = inputs["attention_mask"].unsqueeze(-1)
+        masked_hidden = hidden * attention_mask
+        lengths = attention_mask.sum(dim=1).clamp(min=1)
+
+        mean_pooled = masked_hidden.sum(dim=1) / lengths
+
+    emb = mean_pooled.detach().cpu().numpy().astype(np.float32)
+
+    del inputs, outputs, hidden, attention_mask, masked_hidden, lengths, mean_pooled
+
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    return emb
+
+
+def load_reference_database(
+    known_emb_path: Path,
+    known_meta_path: Path
+):
+    """
+    Load reference embeddings and metadata.
+
+    Embeddings are L2-normalized so that IndexFlatIP returns cosine similarity.
+    """
+    print("\n" + "=" * 70)
+    print("STEP 1. LOAD REFERENCE EMBEDDINGS / METADATA")
+    print("=" * 70)
+
+    check_file_exists(known_emb_path, "Reference embedding")
+    check_file_exists(known_meta_path, "Reference metadata")
+
+    known_emb = np.load(str(known_emb_path)).astype(np.float32)
+    known_meta = pd.read_csv(str(known_meta_path), sep="\t")
+
+    print(f"[INFO] known_emb shape : {known_emb.shape}")
+    print(f"[INFO] known_meta rows : {len(known_meta)}")
+
+    if known_emb.shape[0] != len(known_meta):
+        raise ValueError(
+            "The number of rows in reference embeddings and metadata does not match.\n"
+            f"Embedding rows: {known_emb.shape[0]}\n"
+            f"Metadata rows : {len(known_meta)}"
+        )
+
+    faiss.normalize_L2(known_emb)
+
+    dim = known_emb.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(known_emb)
+
+    print(f"[INFO] FAISS index dimension: {dim}")
+    print(f"[INFO] FAISS index.ntotal : {index.ntotal}")
+
+    return known_emb, known_meta, index
+
+
+def run_search(
+    query_faa: Path,
+    known_meta: pd.DataFrame,
+    index,
+    tokenizer,
+    model,
+    device: str,
+    max_len: int,
+    top_k: int,
+    max_batch_tokens: int,
+    sort_by_length: bool
+) -> pd.DataFrame:
+    """
+    Embed query proteins and search top-k nearest reference proteins.
+    """
+    print("\n" + "=" * 70)
+    print("STEP 2. EMBED QUERY FASTA + FAISS SEARCH")
+    print("=" * 70)
+
+    check_file_exists(query_faa, "Query FASTA")
+
+    query_records = parse_fasta_all(query_faa, max_len=max_len)
+    print(f"[INFO] query proteins: {len(query_records)}")
+
+    if len(query_records) == 0:
+        raise ValueError(f"No valid protein sequence found in query FASTA: {query_faa}")
+
+    batches = make_token_buckets(
+        query_records,
+        max_batch_tokens=max_batch_tokens,
+        sort_by_length=sort_by_length
+    )
+
+    print(f"[INFO] number of batches: {len(batches)}")
+
+    rows = []
+    done = 0
+
+    for batch_idx, batch in enumerate(batches, start=1):
+        batch_indices = [x[0] for x in batch]
+        batch_records = [x[1] for x in batch]
+        batch_seqs = [x["sequence"] for x in batch_records]
+
+        batch_emb = embed_batch(
+            batch_seqs=batch_seqs,
+            tokenizer=tokenizer,
+            model=model,
+            max_len=max_len,
+            device=device
+        )
+
+        faiss.normalize_L2(batch_emb)
+        distances, indices = index.search(batch_emb, top_k)
+
+        for local_i, global_idx in enumerate(batch_indices):
+            query = query_records[global_idx]
+
+            for rank in range(top_k):
+                hit_idx = int(indices[local_i, rank])
+                score = float(distances[local_i, rank])
+
+                if hit_idx < 0:
+                    continue
+
+                hit = known_meta.iloc[hit_idx]
+
+                rows.append({
+                    "unknown_id": query["protein_id"],
+                    "unknown_description": query["description"],
+                    "unknown_annotation": query["annotation"],
+                    "unknown_orig_len": int(query["orig_len"]),
+                    "unknown_used_len": int(query["used_len"]),
+                    "rank": rank + 1,
+                    "cosine_similarity": score,
+
+                    "predicted_annotation": safe_get(hit, "annotation"),
+                    "predicted_gene": safe_get(hit, "gene"),
+                    "predicted_EC_number": safe_get(hit, "EC_number"),
+                    "predicted_COG": safe_get(hit, "COG"),
+                    "predicted_GO": safe_get(hit, "GO"),
+                    "predicted_KEGG": safe_get(hit, "KEGG"),
+                    "predicted_Pfam": safe_get(hit, "Pfam"),
+                    "predicted_InterPro": safe_get(hit, "InterPro"),
+
+                    "known_id": safe_get(hit, "protein_id"),
+                    "known_description": safe_get(hit, "description"),
+                    "known_annotation": safe_get(hit, "annotation"),
+                    "known_orig_len": int(safe_get(hit, "orig_len", 0)),
+                    "known_used_len": int(safe_get(hit, "used_len", 0)),
+                    "known_chunk_idx": int(safe_get(hit, "chunk_idx", -1)),
+                    "known_faiss_row_id": int(safe_get(hit, "faiss_row_id", hit_idx)),
+                })
+
+        done += len(batch_records)
+
+        if batch_idx % 10 == 0 or batch_idx == len(batches):
+            print(
+                f"[INFO] batch {batch_idx}/{len(batches)} | "
+                f"embedded {done}/{len(query_records)} proteins"
+            )
+
+        del batch_emb, distances, indices
+        gc.collect()
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    result_df = pd.DataFrame(rows)
+
+    if result_df.empty:
+        raise RuntimeError("Search finished, but result table is empty.")
+
+    return result_df
+
+
+def create_rank1_table(result_df: pd.DataFrame) -> pd.DataFrame:
+    """Extract rank-1 result for each query protein."""
+    rank1_df = (
+        result_df[result_df["rank"] == 1]
+        .drop_duplicates(subset=["unknown_id"])
+        .copy()
+    )
+
+    return rank1_df
+
+
+def create_prokka_like_table(
+    rank1_df: pd.DataFrame,
+    score_cutoff: float
+) -> pd.DataFrame:
+    """
+    Create Prokka-like TSV table.
+
+    If cosine similarity is below score_cutoff, product is set to hypothetical protein.
+    """
+    rank1_df = rank1_df.copy()
+
+    rank1_df["final_product"] = rank1_df.apply(
+        lambda x: (
+            x["predicted_annotation"]
+            if x["cosine_similarity"] >= score_cutoff
+            else "hypothetical protein"
+        ),
+        axis=1
+    )
+
+    prokka_like_df = pd.DataFrame({
+        "locus_tag": rank1_df["unknown_id"],
+        "ftype": "CDS",
+        "len_bp": rank1_df["unknown_orig_len"].astype(int) * 3,
+        "gene": rank1_df["predicted_gene"],
+        "EC_number": rank1_df["predicted_EC_number"],
+        "COG": rank1_df["predicted_COG"],
+        "known_id": rank1_df["known_id"],
+        "product": rank1_df["final_product"],
+        "cosine_similarity": rank1_df["cosine_similarity"],
+    })
+
+    return prokka_like_df, rank1_df
+
+
+def write_updated_fasta(
+    query_faa: Path,
+    rank1_df: pd.DataFrame,
+    output_faa: Path
+) -> None:
+    """
+    Replace FASTA description with rank-1 predicted product.
+    """
+    rank1_indexed = rank1_df.set_index("unknown_id")
+
+    updated_records = []
+
+    for rec in SeqIO.parse(str(query_faa), "fasta"):
+        protein_id = rec.id
+
+        if protein_id in rank1_indexed.index:
+            new_annotation = str(rank1_indexed.loc[protein_id, "final_product"])
+
+            rec.id = protein_id
+            rec.name = protein_id
+            rec.description = f"{protein_id} {new_annotation}"
+
+        updated_records.append(rec)
+
+    SeqIO.write(updated_records, str(output_faa), "fasta")
+
+
+def save_outputs(
+    result_df: pd.DataFrame,
+    query_faa: Path,
+    outdir: Path,
+    prefix: str,
+    score_cutoff: float
+) -> None:
+    """
+    Save full result, rank-1 result, Prokka-like table, and updated FASTA.
+    """
+    print("\n" + "=" * 70)
+    print("STEP 3. SAVE OUTPUTS")
+    print("=" * 70)
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    output_tsv = outdir / f"{prefix}.tsv"
+    rank1_tsv = outdir / f"{prefix}_rank1.tsv"
+    prokka_like_tsv = outdir / f"{prefix}_prokka_like.tsv"
+    esm_after_faa = outdir / f"{prefix}_ESM_after.faa"
+
+    rank1_df = create_rank1_table(result_df)
+    prokka_like_df, rank1_with_final_product = create_prokka_like_table(
+        rank1_df,
+        score_cutoff=score_cutoff
+    )
+
+    result_df.to_csv(output_tsv, sep="\t", index=False)
+    rank1_with_final_product.to_csv(rank1_tsv, sep="\t", index=False)
+    prokka_like_df.to_csv(prokka_like_tsv, sep="\t", index=False)
+
+    write_updated_fasta(
+        query_faa=query_faa,
+        rank1_df=rank1_with_final_product,
+        output_faa=esm_after_faa
+    )
+
+    print(f"[INFO] Full top-k result TSV : {output_tsv}")
+    print(f"[INFO] Rank-1 result TSV    : {rank1_tsv}")
+    print(f"[INFO] Prokka-like TSV      : {prokka_like_tsv}")
+    print(f"[INFO] Updated FASTA        : {esm_after_faa}")
+
+    print("\n[INFO] Preview:")
+    print(result_df.head(10).to_string(index=False))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="ESM-2 embedding + FAISS nearest-neighbor protein annotation"
+    )
+
+    parser.add_argument(
+        "--known-emb",
+        required=True,
+        type=Path,
+        help="Path to reference embedding .npy file"
+    )
+
+    parser.add_argument(
+        "--known-meta",
+        required=True,
+        type=Path,
+        help="Path to reference metadata .tsv file"
+    )
+
+    parser.add_argument(
+        "--query-faa",
+        required=True,
+        type=Path,
+        help="Path to query protein FASTA file"
+    )
+
+    parser.add_argument(
+        "--outdir",
+        required=True,
+        type=Path,
+        help="Output directory"
+    )
+
+    parser.add_argument(
+        "--prefix",
+        default="esm_faiss_result",
+        help="Output file prefix"
+    )
+
+    parser.add_argument(
+        "--model-name",
+        default="facebook/esm2_t33_650M_UR50D",
+        help="Hugging Face ESM model name"
+    )
+
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device to use: auto, cpu, or cuda"
+    )
+
+    parser.add_argument(
+        "--max-len",
+        type=int,
+        default=1022,
+        help="Maximum protein sequence length for ESM input"
+    )
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=3,
+        help="Number of nearest neighbors to retrieve"
+    )
+
+    parser.add_argument(
+        "--score-cutoff",
+        type=float,
+        default=0.80,
+        help="Cosine similarity cutoff for assigning predicted product"
+    )
+
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=min(16, os.cpu_count() or 1),
+        help="Number of CPU threads"
+    )
+
+    parser.add_argument(
+        "--interop-threads",
+        type=int,
+        default=1,
+        help="Number of PyTorch inter-op threads"
+    )
+
+    parser.add_argument(
+        "--cpu-max-batch-tokens",
+        type=int,
+        default=12000,
+        help="Maximum batch tokens for CPU"
+    )
+
+    parser.add_argument(
+        "--gpu-max-batch-tokens",
+        type=int,
+        default=30000,
+        help="Maximum batch tokens for GPU"
+    )
+
+    parser.add_argument(
+        "--no-sort-by-length",
+        action="store_true",
+        help="Disable sorting sequences by length before batching"
+    )
+
+    parser.add_argument(
+        "--dynamic-quant",
+        action="store_true",
+        help="Apply dynamic quantization on CPU"
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    device = resolve_device(args.device)
+
+    max_batch_tokens = (
+        args.gpu_max_batch_tokens
+        if device == "cuda"
+        else args.cpu_max_batch_tokens
+    )
+
+    sort_by_length = not args.no_sort_by_length
+
+    print("\n" + "=" * 70)
+    print("ESM-2 + FAISS ANNOTATION")
+    print("=" * 70)
+    print(f"[INFO] model_name       : {args.model_name}")
+    print(f"[INFO] device           : {device}")
+    print(f"[INFO] known_emb        : {args.known_emb}")
+    print(f"[INFO] known_meta       : {args.known_meta}")
+    print(f"[INFO] query_faa        : {args.query_faa}")
+    print(f"[INFO] outdir           : {args.outdir}")
+    print(f"[INFO] prefix           : {args.prefix}")
+    print(f"[INFO] max_len          : {args.max_len}")
+    print(f"[INFO] top_k            : {args.top_k}")
+    print(f"[INFO] score_cutoff     : {args.score_cutoff}")
+    print(f"[INFO] cpu_threads      : {args.cpu_threads}")
+    print(f"[INFO] interop_threads  : {args.interop_threads}")
+    print(f"[INFO] max_batch_tokens : {max_batch_tokens}")
+    print(f"[INFO] sort_by_length   : {sort_by_length}")
+    print(f"[INFO] dynamic_quant    : {args.dynamic_quant}")
+
+    configure_torch(
+        device=device,
+        cpu_threads=args.cpu_threads,
+        interop_threads=args.interop_threads
+    )
+
+    _, known_meta, index = load_reference_database(
+        known_emb_path=args.known_emb,
+        known_meta_path=args.known_meta
+    )
+
+    tokenizer, model = load_model(
+        model_name=args.model_name,
+        device=device,
+        use_dynamic_quant=args.dynamic_quant
+    )
+
+    result_df = run_search(
+        query_faa=args.query_faa,
+        known_meta=known_meta,
+        index=index,
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        max_len=args.max_len,
+        top_k=args.top_k,
+        max_batch_tokens=max_batch_tokens,
+        sort_by_length=sort_by_length
+    )
+
+    save_outputs(
+        result_df=result_df,
+        query_faa=args.query_faa,
+        outdir=args.outdir,
+        prefix=args.prefix,
+        score_cutoff=args.score_cutoff
+    )
+
+    print("\nALL DONE")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[ERROR] Interrupted by user.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
